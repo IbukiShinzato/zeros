@@ -123,3 +123,97 @@ impl Shell {
         exit(exit_val);
     }
 }
+
+/// signal_handlerスレッド
+fn spawn_sig_handler(tx: Sender<WorkerMsg>) -> Result<(), DynError> {
+    let mut signals = Signals::new(&[SIGINT, SIGTSTP, SIGCHLD])?;
+    thread::spawn(move || {
+        for sig in signals.forever() {
+            // シグナルを受信しworkerスレッドに転送
+            tx.send(WorkerMsg::Signal(sig)).unwrap();
+        }
+    });
+
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum ProcState {
+    Run,  // 実行中
+    Stop, // 停止中
+}
+
+#[derive(Debug, Clone)]
+struct ProcInfo {
+    state: ProcState, // 実行状態
+    pgid: Pid,        // プロセスグループID
+}
+
+#[derive(Debug)]
+struct Worker {
+    exit_val: i32,   // 終了コード
+    fg: Option<Pid>, // フォアグラウンドのプロセスグループID
+
+    // ジョブIDから（プロセスグループID, 実行コマンド）へのマップ
+    jobs: BTreeMap<usize, (Pid, String)>,
+
+    // プロセスグループIDから（ジョブID, プロセスID）へのマップ
+    pgid_to_pids: HashMap<Pid, (usize, HashSet<Pid>)>,
+
+    pid_to_info: HashMap<Pid, ProcInfo>, // プロセスIDからプロセスグループIDへのマップ
+    shell_pgid: Pid,                     // シェルのプロセスグループID
+}
+
+impl Worker {
+    fn new() -> Self {
+        Worker {
+            exit_val: 0,
+            fg: None, // フォアグラウンドはシェル
+            jobs: BTreeMap::new(),
+            pgid_to_pids: HashMap::new(),
+            pid_to_info: HashMap::new(),
+
+            // シェルのプロセスグループIDを取得
+            // tcgetpgrpを使用することによってshellがフォアグラウンドであるかも検査できる
+            shell_pgid: tcgetpgrp(libc::STDIN_FILENO).unwrap(), // libc::STDIN_FILENOは標準入力（0番）
+        }
+    }
+
+    /// workerスレッドを起動。
+    fn spawn(mut self, worker_rx: Receiver<WorkerMsg>, shell_tx: SyncSender<ShellMsg>) {
+        thread::spawn(move || {
+            for msg in worker_rx.iter() {
+                // worker_txからメッセージを受信。
+                match msg {
+                    WorkerMsg::Cmd(line) => {
+                        match parse_cmd(&line) {
+                            // コマンド実行メッセージの場合、parse_cmdでメッセージをパース。
+                            Ok(cmd) => {
+                                if self.build_in_cmd(&cmd, &shell_tx) {
+                                    // 組み込みコマンド（シェルの内部コマンド）を実行。
+                                    // 組み込みコマンドならworker_rxから受信
+                                    continue;
+                                }
+
+                                if !self.spawn_child(&line, &cmd) {
+                                    // 組み込みコマンドでない場合は、spawn_childを呼び出し、外部プログラムを実行。
+                                    // 子プロセス生成に失敗した場合、シェルからの入力を再開
+                                    shell_tx.send(ShellMsg::Continue(self.exit_val).unwrap());
+                                }
+                            }
+
+                            Err(e) => {
+                                eprintln!("ZeroSh: {}", e);
+                                shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap(); // コマンドのパースに失敗した場合は入力を再開するため、main スレッドに通知。
+                            }
+                        }
+                    }
+                    WorkerMsg::Signal(SIGCHLD) => {
+                        self.wait_child(&shell_tx); // 子プロセスの状態変化管理。SIGCHLDしぐらぬを受信した場合は、wait_childを呼び出し、子プロセスの状態変化を管理。
+                    }
+                    _ => (), // 無視
+                }
+            }
+        });
+    }
+}

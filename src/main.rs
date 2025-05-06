@@ -2,6 +2,6 @@ mod helper;
 mod shell;
 
 fn main() {
-    let v = vec![1, 2, 3];
-    println!("{}", v[4]);
+    use nix::libc;
+    println!("{}", libc::STDIN_FILENO);
 }
