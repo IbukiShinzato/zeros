@@ -13,7 +13,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::CString,
     mem::replace,
-    path::PathBuf,
     process::exit,
     sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
     thread,
@@ -70,13 +69,13 @@ impl Shell {
         let (worker_tx, worker_rx) = channel();
         let (shell_tx, shell_rx) = sync_channel(0);
         spawn_sig_handler(worker_tx.clone())?;
-        Worker::new().spawn(worker_rx, worker_tx);
+        Worker::new().spawn(worker_rx, shell_tx);
 
         let exit_val; // 終了コード
         let mut prev = 0; // 直前の終了コード
         loop {
             // 1行読み込んで、その行をworkerスレッドに送信
-            let face = if prev == 0 { '\u{1F642}' } else { '\u{1F480}' };
+            let face = if prev == 0 { '\u{1F982}' } else { '\u{1F4A9}' };
             match rl.readline(&format!("ZeroSh {} %> ", face)) {
                 Ok(line) => {
                     let line_trimed = line.trim(); // 行頭と行まつの空白文字を削除
@@ -198,7 +197,7 @@ impl Worker {
                                 if !self.spawn_child(&line, &cmd) {
                                     // 組み込みコマンドでない場合は、spawn_childを呼び出し、外部プログラムを実行。
                                     // 子プロセス生成に失敗した場合、シェルからの入力を再開
-                                    shell_tx.send(ShellMsg::Continue(self.exit_val).unwrap());
+                                    shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
                                 }
                             }
 
@@ -253,8 +252,8 @@ impl Worker {
         if cmd.len() == 2 {
             // パイプを作成
             let p = pipe().unwrap();
-            input = Some(p.0);
-            output = Some(p.1);
+            input = Some(p.0); // 読み取り専用のファイルディスクリプタ(3番)
+            output = Some(p.1); // 書き込み専用のファイルディスクリプタ（4番）
         }
 
         // パイプを閉じる関数を定義
@@ -273,6 +272,7 @@ impl Worker {
         let pgid;
         // 1つ目のプロセスを生成
         match fork_exec(Pid::from_raw(0), cmd[0].0, &cmd[0].1, None, output) {
+            // from_rawの引数に0を入れると自動でpgidを割り当てる
             Ok(child) => pgid = child,
             Err(e) => {
                 eprintln!("ZeroSh: プロセス生成エラー: {}", e);
@@ -293,9 +293,9 @@ impl Worker {
             match fork_exec(pgid, cmd[1].0, &cmd[1].1, input, None) {
                 Ok(child) => {
                     pids.insert(child, info);
-                },
+                }
                 Err(e) => {
-                    eprintln!("ZeroSh: プロセス生成エラー: {}", e),
+                    eprintln!("ZeroSh: プロセス生成エラー: {}", e);
                     return false;
                 }
             }
@@ -340,6 +340,98 @@ impl Worker {
         true
     }
 
+    /// 子プロセスの状態変化を管理。
+    fn wait_child(&mut self, shell_tx: &SyncSender<ShellMsg>) {
+        // WUNTRACED: 子プロセスのていし
+        // WNOHANG: ブロックしない
+        // WCONTINUED: 実行再開
+        let flag = Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WNOHANG | WaitPidFlag::WCONTINUED);
+
+        loop {
+            match syscall(|| waitpid(Pid::from_raw(-1), flag)) {
+                // from_rawの引き数に-1を指定することで任意の子プロセスの状態変化を検知
+                Ok(WaitStatus::Exited(pid, status)) => {
+                    // プロセスが終了
+                    self.exit_val = status; // 終了コードを保存
+                    self.process_term(pid, shell_tx);
+                }
+                Ok(WaitStatus::Signaled(pid, sig, core)) => {
+                    // プロセスがシグナルにより終了
+                    eprintln!(
+                        "\nZeroSh: 子プロセスがシグナルにより終了{}: pid = {}, signal = {}",
+                        if core { "（コアダンプ）" } else { "" },
+                        pid,
+                        sig
+                    );
+                }
+                // プロセスが停止
+                Ok(WaitStatus::Stopped(pid, _sig)) => self.process_stop(pid, shell_tx),
+                // プロセスが実行再開
+                Ok(WaitStatus::Continued(pid)) => self.process_continue(pid),
+                Ok(WaitStatus::StillAlive) => return, // waitすべき子プロセスはいない。
+                Err(nix::Error::ECHILD) => return,    // 子プロセスはいない
+                Err(e) => {
+                    eprintln!("\nZeroSh: waitが失敗: {}", e);
+                    exit(1);
+                }
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Ok(WaitStatus::PtraceEvent(pid, _, _) | WaitStatus::PtrasySyscall(pid)) => {
+                    self.process_stop(pid, shell_tx)
+                }
+            }
+        }
+    }
+
+    /// プロセスの終了処理。
+    fn process_term(&mut self, pid: Pid, shell_tx: &SyncSender<ShellMsg>) {
+        // プロセスのIDを削除し、必要ならフォアグラウンドプロセスにシェルを設定
+        if let Some((job_id, pgid)) = self.remove_pid(pid) {
+            self.manage_job(job_id, pgid, shell_tx);
+        }
+    }
+
+    /// プロセスの停止処理。
+    fn process_stop(&mut self, pid: Pid, shell_tx: &SyncSender<ShellMsg>) {
+        self.set_pid_state(pid, ProcState::Stop); // プロセスを停止中に設定
+        let pgid = self.pid_to_info.get(&pid).unwrap().pgid; // プロセスグループIDを取得
+        let job_id = self.pgid_to_pids.get(&pgid).unwrap().0; // ジョブIDを取得
+        self.manage_job(job_id, pgid, shell_tx); // 必要ならフォアグラウンドプロセスをシェルに設定
+    }
+
+    /// プロセスの再開処理
+    fn process_continue(&mut self, pid: Pid) {
+        self.set_pid_state(pid, ProcState::Run);
+    }
+
+    ///　ジョブの管理。引数には変化のあったジョブとプロセスグループを指定。
+    ///
+    /// - フォアグラウンドプロセスが空の場合、シェルをフォアグラウンドに設定。
+    /// - フォアグラウンドプロセスが全て停止中の場合、シェルをフォアグラウンドに設定。
+    fn manage_job(&mut self, job_id: usize, pgid: Pid, shell_tx: &SyncSender<ShellMsg>) {
+        let is_fg = self.fg.map_or(false, |x| pgid == x); // フォアグラウンドのプロセスか?
+        let line = &self.jobs.get(&job_id).unwrap().1;
+        if is_fg {
+            // 状態が変化したプロセスはフォアグラウンドに設定
+            if self.is_group_empty(pgid).unwrap() {
+                // フォアグラウンドプロセスが空の場合、
+                // ジョブ情報を削除してシェルをフォアグラウンドに設定
+                eprintln!("[{}] 終了\t{}", job_id, line);
+                self.remove_job(job_id);
+                self.set_shell_fg(shell_tx);
+            } else if self.is_group_stop(pgid).unwrap() {
+                // フォアグラウンドプロセスが全て停止中の場合、シェルをフォアグラウンドに設定
+                eprintln!("\n[{}] 停止\t{}", job_id, line);
+                self.set_shell_fg(shell_tx);
+            }
+        } else {
+            // プロセスグループが空の場合、ジョブ情報を削除
+            if self.is_group_empty(pgid).unwrap() {
+                eprintln!("\n[{}] 終了\t{}", job_id, line);
+                self.remove_job(job_id);
+            }
+        }
+    }
+
     /// fgコマンドを実行。
     fn run_fg(&mut self, args: &[&str], shell_tx: &SyncSender<ShellMsg>) -> bool {
         self.exit_val = 1; // とりあえず失敗に設定
@@ -371,33 +463,149 @@ impl Worker {
         shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap(); // シェルを再開
         true
     }
+
+    /// 新たなジョブ情報を追加。
+    fn insert_job(&mut self, job_id: usize, pgid: Pid, pids: HashMap<Pid, ProcInfo>, line: &str) {
+        assert!(!self.jobs.contains_key(&job_id));
+        self.jobs.insert(job_id, (pgid, line.to_string())); // ジョブ情報を追加
+
+        let mut procs = HashSet::new(); // pgid_to_pidsへ追加するプロセス
+        for (pid, info) in pids {
+            procs.insert(pid);
+
+            assert!(!self.pid_to_info.contains_key(&pid));
+            self.pid_to_info.insert(pid, info); // プロセスの情報を追加
+        }
+
+        assert!(!self.pid_to_info.contains_key(&pgid));
+        self.pgid_to_pids.insert(pgid, (job_id, procs)); // プロセスグループの情報を追加
+    }
+
+    /// プロセスの実行状態を設定し、以前の状態を返す。
+    /// pidが存在しないプロセスの場合はNoneを返す。
+    fn set_pid_state(&mut self, pid: Pid, state: ProcState) -> Option<ProcState> {
+        let info = self.pid_to_info.get_mut(&pid)?;
+        Some(replace(&mut info.state, state)) // info.stateとstateの情報を入れ替える
+    }
+
+    /// プロセスの情報を削除し、削除できた場合はプロセスの所属する
+    /// (ジョブID、プロセスグループID)を返す。
+    /// 存在しないプロセスの場合はNoneを返す。
+    fn remove_pid(&mut self, pid: Pid) -> Option<(usize, Pid)> {
+        let pgid = self.pid_to_info.get(&pid)?.pgid; // プロセスグループIDを取得
+        let it = self.pgid_to_pids.get_mut(&pgid)?;
+        it.1.remove(&pid); // プロセスグループからpidを削除
+        let job_id = it.0; // ジョブIDを取得
+        Some((job_id, pgid))
+    }
+
+    /// ジョブ情報を削除し、関連するプロセスグループの情報も削除。
+    fn remove_job(&mut self, job_id: usize) {
+        if let Some((pgid, _)) = self.jobs.remove(&job_id) {
+            if let Some((_, pids)) = self.pgid_to_pids.remove(&pgid) {
+                assert!(pids.is_empty()); // ジョブを削除する時はプロセスグループは空のはず
+            }
+        }
+    }
+
+    /// 空のプロセスグループなら真。
+    fn is_group_empty(&self, pgid: Pid) -> Option<bool> {
+        Some(self.pgid_to_pids.get(&pgid)?.1.is_empty())
+    }
+
+    /// プロセスグループのプロセス全てが停止中なら真。
+    fn is_group_stop(&self, pgid: Pid) -> Option<bool> {
+        for pid in self.pgid_to_pids.get(&pgid)?.1.iter() {
+            if self.pid_to_info.get(pid).unwrap().state == ProcState::Run {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// シェルをフォアグラウンドに設定
+    fn set_shell_fg(&mut self, shell_tx: &SyncSender<ShellMsg>) {
+        self.fg = None; // fgの値が必要なければ単なる代入で良い。必要ならtake（）で取得。
+        tcsetpgrp(libc::STDIN_FILENO, self.shell_pgid).unwrap();
+        shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
+    }
+
+    /// 新たなジョブIDを取得。
+    fn get_new_job_id(&self) -> Option<usize> {
+        for i in 0..=usize::MAX {
+            if !self.jobs.contains_key(&i) {
+                // jobに使われていない最小値を返す。
+                return Some(i);
+            }
+        }
+        None
+    }
 }
 
 type CmdResult<'a> = Result<Vec<(&'a str, Vec<&'a str>)>, DynError>;
 
 /// コマンドをパース
 fn parse_cmd(line: &str) -> CmdResult {
-    let commands: Vec<&str> = line.split('|').map(|x| x.trim()).collect();
     let mut result = vec![];
 
-    for cmd in commands {
-        let command: Vec<&str> = cmd.split(" ").collect();
-        if let Some(&c) = command.get(0) {
-            if let Some(_) = command.get(1) {
-                let mut args = vec![];
-                for i in 1..command.len() {
-                    let arg = command[i];
-                    println!("{}", arg);
-                    args.push(arg);
-                }
-                result.push((c, args))
-            } else {
-                result.push((c, vec![]));
-            }
+    for cmd in line.split('|').map(|s| s.trim()) {
+        let mut parts = cmd.split_whitespace();
+        if let Some(command) = parts.next() {
+            let args: Vec<&str> = parts.collect();
+            result.push((command, args));
         }
     }
 
     Ok(result)
+}
+
+/// プロセスグループIDを指定してfork & exec。
+/// pgidが0の場合は子プロセスのプロセスIDが、プロセスグループIDとなる。
+///
+/// - inputがSome(fd)の場合は、標準入力をfdと設定。
+/// - outputがSome(fd)の場合は、標準出力をfdと設定。
+fn fork_exec(
+    pgid: Pid,
+    filename: &str,
+    args: &[&str],
+    input: Option<i32>,
+    output: Option<i32>,
+) -> Result<Pid, DynError> {
+    let filename = CString::new(filename).unwrap();
+    let args: Vec<CString> = args.iter().map(|&s| CString::new(s).unwrap()).collect();
+
+    match syscall(|| unsafe { fork() })? {
+        ForkResult::Parent { child, .. } => {
+            // 子プロセスのプロセスグループIDをpgidに設定
+            setpgid(child, pgid).unwrap();
+            Ok(child)
+        }
+        ForkResult::Child => {
+            setpgid(Pid::from_raw(0), pgid).unwrap();
+
+            // 標準入出力を設定
+            if let Some(infd) = input {
+                syscall(|| dup2(infd, libc::STDIN_FILENO)).unwrap();
+            }
+            if let Some(outfd) = output {
+                syscall(|| dup2(outfd, libc::STDOUT_FILENO)).unwrap();
+            }
+
+            // signal_hookで利用されるUnixドメインソケットとpipeをクローズ（標準入出力と標準エラー出力以外のファイルディスクプリタ）
+            for i in 3..=6 {
+                let _ = syscall(|| unistd::close(i));
+            }
+
+            // 実行ファイルをメモリに読み込み
+            match execvp(&filename, &args) {
+                Err(_) => {
+                    unistd::write(libc::STDERR_FILENO, "不明なコマンドを実行\n".as_bytes()).ok(); // ok(): Converts from Result<T, E> to Option<T>
+                    exit(1);
+                }
+                Ok(_) => unreachable!(), // このコードに到達しないことを明示。
+            }
+        }
+    }
 }
 
 /// ドロップ時にクロージャFを呼び出す型。
