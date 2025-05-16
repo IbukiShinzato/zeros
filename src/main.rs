@@ -6,6 +6,13 @@ use helper::DynError;
 const HISTORY_FILE: &str = ".zerosh_history";
 
 fn main() -> Result<(), DynError> {
+    // debug code
+    // --------
+    use rustyline::error::ReadlineError;
+    println!("{}", ReadlineError::Interrupted);
+
+    // --------
+
     let mut logfile = HISTORY_FILE;
     let mut home = dirs::home_dir();
     if let Some(h) = &mut home {

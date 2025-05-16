@@ -57,7 +57,7 @@ impl Shell {
 
     /// mainスレッド。
     pub fn run(&self) -> Result<(), DynError> {
-        // SIGTTOUを無視に設定しないと、SIGTSTP(Ctrl + Z)が配送される。
+        // // SIGTTOUを無視に設定しないと、SIGTSTP(Ctrl + Z)が配送される。
         unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn).unwrap() };
 
         let mut rl = Editor::<()>::new()?;
@@ -74,8 +74,30 @@ impl Shell {
         let exit_val; // 終了コード
         let mut prev = 0; // 直前の終了コード
         loop {
+            use signal_hook::consts::signal::SIGTSTP;
+            use signal_hook::iterator::Signals;
+            use std::sync::{Arc, Mutex};
+            let worker_tx = Arc::new(Mutex::new(worker_tx.clone()));
+
+            let mut signals = Signals::new(&[SIGTSTP]).unwrap();
+            let worker_tx_clone = Arc::clone(&worker_tx);
+
+            std::thread::spawn(move || {
+                for sig in signals.forever() {
+                    if sig == SIGTSTP {
+                        println!("\nZeroSh: suspended");
+                        worker_tx_clone
+                            .lock()
+                            .unwrap()
+                            .send(WorkerMsg::Signal(SIGTSTP))
+                            .unwrap();
+                    }
+                }
+            });
+
             // 1行読み込んで、その行をworkerスレッドに送信
-            let face = if prev == 0 { '\u{1F982}' } else { '\u{1F4A9}' };
+            let face = if prev == 0 { '\u{1F982}' } else { '\u{1F4A9}' }; // prompt
+            let worker_tx_clone = Arc::clone(&worker_tx);
             match rl.readline(&format!("ZeroSh {} %> ", face)) {
                 Ok(line) => {
                     let line_trimed = line.trim(); // 行頭と行まつの空白文字を削除
@@ -86,7 +108,11 @@ impl Shell {
                     }
 
                     // workerスレッドに送信
-                    worker_tx.send(WorkerMsg::Cmd(line)).unwrap();
+                    worker_tx_clone
+                        .lock()
+                        .unwrap()
+                        .send(WorkerMsg::Cmd(line))
+                        .unwrap();
                     match shell_rx.recv().unwrap() {
                         ShellMsg::Continue(n) => prev = n, // 読み込み再開
                         ShellMsg::Quit(n) => {
@@ -98,7 +124,11 @@ impl Shell {
                 }
                 Err(ReadlineError::Interrupted) => eprintln!("ZeroSh: 終了はCtrl+d"),
                 Err(ReadlineError::Eof) => {
-                    worker_tx.send(WorkerMsg::Cmd("exit".to_string())).unwrap();
+                    worker_tx_clone
+                        .lock()
+                        .unwrap()
+                        .send(WorkerMsg::Cmd("exit".to_string()))
+                        .unwrap();
                     match shell_rx.recv().unwrap() {
                         ShellMsg::Quit(n) => {
                             // シェルを終了
@@ -210,6 +240,9 @@ impl Worker {
                     WorkerMsg::Signal(SIGCHLD) => {
                         self.wait_child(&shell_tx); // 子プロセスの状態変化管理。SIGCHLDしぐらぬを受信した場合は、wait_childを呼び出し、子プロセスの状態変化を管理。
                     }
+                    WorkerMsg::Signal(SIGTSTP) => {
+                        self.wait_child(&shell_tx);
+                    }
                     _ => (), // 無視
                 }
             }
@@ -223,7 +256,7 @@ impl Worker {
 
         match cmd[0].0 {
             "exit" => self.run_exit(&cmd[0].1, shell_tx),
-            // "jobs" => self.run_jobs(shell_tx),
+            "jobs" => self.run_jobs(shell_tx),
             "fg" => self.run_fg(&cmd[0].1, shell_tx),
             // "cd" => self.run_cd(&cmd[0].1, shell_tx),
             _ => false,
@@ -340,9 +373,52 @@ impl Worker {
         true
     }
 
+    /// jobsコマンドを実行
+    fn run_jobs(&self, shell_tx: &SyncSender<ShellMsg>) -> bool {
+        let jobs = &self.jobs;
+        for (job_id, (pgid, (pid, line))) in jobs.iter().enumerate() {
+            println!("[{}]: pgid: {} pid: {}  {}", job_id, pgid, pid, line);
+        }
+
+        shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
+        true
+    }
+
+    /// fgコマンドを実行。
+    fn run_fg(&mut self, args: &[&str], shell_tx: &SyncSender<ShellMsg>) -> bool {
+        self.exit_val = 1; // とりあえず失敗に設定
+
+        // 引数をチェック
+        if args.len() < 2 {
+            eprintln!("usage: fg <num>");
+            shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap(); // シェルを再開
+            return false;
+        }
+
+        // ジョブIDを取得
+        if let Ok(n) = args[1].parse::<usize>() {
+            if let Some((pgid, cmd)) = self.jobs.get(&n) {
+                eprintln!("[{}] 再開\t{}", n, cmd);
+
+                // フォアグラウンドプロセスに設定
+                self.fg = Some(*pgid);
+                tcsetpgrp(libc::STDIN_FILENO, *pgid).unwrap();
+
+                // ジョブの実行を再開
+                killpg(*pgid, Signal::SIGCONT).unwrap();
+                return true;
+            }
+        };
+
+        // 失敗
+        eprintln!("{}というジョブは見つかりませんでした。", args[1]);
+        shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap(); // シェルを再開
+        true
+    }
+
     /// 子プロセスの状態変化を管理。
     fn wait_child(&mut self, shell_tx: &SyncSender<ShellMsg>) {
-        // WUNTRACED: 子プロセスのていし
+        // WUNTRACED: 子プロセスの停止
         // WNOHANG: ブロックしない
         // WCONTINUED: 実行再開
         let flag = Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WNOHANG | WaitPidFlag::WCONTINUED);
@@ -365,7 +441,10 @@ impl Worker {
                     );
                 }
                 // プロセスが停止
-                Ok(WaitStatus::Stopped(pid, _sig)) => self.process_stop(pid, shell_tx),
+                Ok(WaitStatus::Stopped(pid, _sig)) => {
+                    println!("stopped!");
+                    self.process_stop(pid, shell_tx)
+                }
                 // プロセスが実行再開
                 Ok(WaitStatus::Continued(pid)) => self.process_continue(pid),
                 Ok(WaitStatus::StillAlive) => return, // waitすべき子プロセスはいない。
@@ -430,38 +509,6 @@ impl Worker {
                 self.remove_job(job_id);
             }
         }
-    }
-
-    /// fgコマンドを実行。
-    fn run_fg(&mut self, args: &[&str], shell_tx: &SyncSender<ShellMsg>) -> bool {
-        self.exit_val = 1; // とりあえず失敗に設定
-
-        // 引数をチェック
-        if args.len() < 2 {
-            eprintln!("usage: fg <num>");
-            shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap(); // シェルを再開
-            return false;
-        }
-
-        // ジョブIDを取得
-        if let Ok(n) = args[1].parse::<usize>() {
-            if let Some((pgid, cmd)) = self.jobs.get(&n) {
-                eprintln!("[{}] 再開\t{}", n, cmd);
-
-                // フォアグラウンドプロセスに設定
-                self.fg = Some(*pgid);
-                tcsetpgrp(libc::STDIN_FILENO, *pgid).unwrap();
-
-                // ジョブの実行を再開
-                killpg(*pgid, Signal::SIGCONT).unwrap();
-                return true;
-            }
-        };
-
-        // 失敗
-        eprintln!("{}というジョブは見つかりませんでした。", args[1]);
-        shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap(); // シェルを再開
-        true
     }
 
     /// 新たなジョブ情報を追加。
